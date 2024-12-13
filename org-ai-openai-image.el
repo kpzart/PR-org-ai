@@ -24,6 +24,11 @@
 
 (require 'org-ai-openai)
 
+(defcustom org-ai-save-image-as-attachment nil
+  "If set, images will be stored as attachments to current heading."
+  :group 'org-ai
+  :type 'bool)
+
 (defcustom org-ai-image-directory (expand-file-name "org-ai-images/" org-directory)
   "Directory where images are stored."
   :group 'org-ai
@@ -78,15 +83,15 @@ for more information."
   (with-temp-file file-name
     (insert (base64-decode-string base64-string))))
 
-(defun org-ai--images-save (data size &optional prompt)
-  "Save the image `DATA' to into a file. Use `SIZE' to determine the file name.
+(defun org-ai--images-save (data size dir &optional prompt)
+  "Save the image `DATA' to into a file in `DIR'. Use `SIZE' to determine the file name.
 Also save the `PROMPT' to a file."
-  (make-directory org-ai-image-directory t)
+  (make-directory dir t)
   (cl-loop for ea across (alist-get 'data data)
-           collect (let ((file-name (org-ai--make-up-new-image-file-name org-ai-image-directory size)))
-                     (when prompt (with-temp-file (string-replace ".png" ".txt" file-name) (insert prompt)))
-                     (org-ai--image-save-base64-payload (alist-get 'b64_json ea) file-name)
-                     file-name)))
+           collect (let ((file-path (org-ai--make-up-new-image-file-name dir size)))
+                     (when prompt (with-temp-file (string-replace ".png" ".txt" file-path) (insert prompt)))
+                     (org-ai--image-save-base64-payload (alist-get 'b64_json ea) file-path)
+                     file-path)))
 
 (defun org-ai--make-up-new-image-file-name (dir size &optional n)
   "Make up a new file name for an image. Use `DIR' as the directory.
@@ -154,7 +159,8 @@ given, call it with the file name of the image as argument."
   (org-ai--validate-image-size model size)
   (org-ai--validate-image-style style)
   (org-ai--validate-image-quality quality)
-  (let* ((url-request-extra-headers `(("Authorization" . ,(string-join `("Bearer" ,(org-ai--openai-get-token)) " "))
+  (let* ((save-dir (or (and org-ai-save-image-as-attachment (org-attach-dir t t)) org-ai-image-directory))
+         (url-request-extra-headers `(("Authorization" . ,(string-join `("Bearer" ,(org-ai--openai-get-token)) " "))
                                       ("Content-Type" . "application/json")))
          (url-request-method "POST")
          (endpoint org-ai-openai-image-generation-endpoint)
@@ -182,7 +188,7 @@ given, call it with the file name of the image as argument."
                (goto-char url-http-end-of-headers)
                (setq org-ai--current-request-buffer-for-image nil)
                (org-ai--load-image-stop-animation)
-               (let ((files (org-ai--images-save (json-read) size prompt)))
+               (let ((files (org-ai--images-save (json-read) size save-dir prompt)))
                  (when callback
                    (cl-loop for file in files
                             for i from 0
@@ -219,7 +225,8 @@ object."
          (quality (or (when-let ((it (alist-get :quality info))) (intern it))
                       (when-let ((it (org-entry-get-with-inheritance "IMAGE_QUALITY"))) (intern it))
                       org-ai-image-default-quality))
-         (buffer (current-buffer)))
+         (buffer (current-buffer))
+         (will-save-as-attachment (and org-ai-save-image-as-attachment (org-attach-dir t t))))
     (org-ai--image-request prompt
                            :model model
                            :n n
@@ -238,7 +245,10 @@ object."
                                              (forward-line)
                                              (when name
                                                (insert (format "#+NAME: %s%s\n" name (if (> n 0) (format "_%s" i) "") )))
-                                             (insert (format "[[file:%s]]\n" file))
+                                             (insert (if will-save-as-attachment
+                                                         (format "[[attachment:%s]]\n" (file-name-nondirectory file))
+                                                       (format "[[file:%s]]\n" file)))
+                                             (org-attach-sync)
                                              (org-display-inline-images))))))))
 
 ;; -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -251,7 +261,8 @@ to the image."
   (interactive (list (let ((at-point (org-ai--image-variation--get-path-of-link-at-point))) (read-file-name "image: " nil at-point nil at-point))
                      (read-number "n: " 1)
                      (completing-read "size: " '("256x256" "512x512" "1024x1024") nil t "256x256" nil "256x256")))
-  (let ((buffer (current-buffer)))
+  (let ((buffer (current-buffer))
+        (will-save-as-attachment (and org-ai-save-image-as-attachment (org-attach-dir t t))))
     (org-ai--image-variation-request path
                                      :n n
                                      :size size
@@ -260,7 +271,10 @@ to the image."
                                                  (with-current-buffer buffer
                                                    (save-excursion
                                                      (move-end-of-line 1)
-                                                     (insert (format "\n\n[[file:%s]]\n" file))
+                                                     (insert (if will-save-as-attachment
+                                                                 (format "[[attachment:%s]]\n" (file-name-nondirectory file))
+                                                               (format "\n\n[[file:%s]]\n" file)))
+                                                     (org-attach-sync)
                                                      (org-display-inline-images)))))))
 
 (cl-defun org-ai--image-variation-request (image-file-path &key n size callback)
@@ -271,7 +285,8 @@ with the file name of the image as argument. Note this requries
 curl to be installed."
   (unless (executable-find "curl")
     (error "Unable to find curl"))
-  (let ((command (format "curl --silent %s \\
+  (let ((save-dir (or (and org-ai-save-image-as-attachment (org-attach-dir t t)) org-ai-image-directory))
+        (command (format "curl --silent %s \\
                          -H 'Authorization: Bearer %s' \\
                          -F image='@%s' \\
                          -F n=%s \\
@@ -290,11 +305,11 @@ curl to be installed."
                  (let ((data (json-read)))
                    (if (alist-get 'error data)
                        (error (alist-get 'error data))
-                       (let ((files (org-ai--images-save data size)))
-                            (when callback
-                              (cl-loop for file in files
-                                       for i from 0
-                                       do (funcall callback file i)))))))
+                     (let ((files (org-ai--images-save data size save-dir)))
+                       (when callback
+                         (cl-loop for file in files
+                                  for i from 0
+                                  do (funcall callback file i)))))))
 
         (error (let ((buffer-content (buffer-string))
                      (error-buffer (get-buffer-create "*org-ai-image-variation-error*")))
